@@ -1,0 +1,6 @@
+{
+  "name": "ordieo",
+  "description": "Audio converter, AI transcriber with live SRT & Hinglish conversion, and native on-device video compressor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

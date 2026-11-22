@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">ordieo</string>
+    <string name="badge_auto_lang">Auto: Hindi / English</string>
+    <string name="empty_title">No transcriptions yet</string>
+    <string name="empty_subtitle">Tap + to upload video or audio, record voice, or import .SRT / .TXT files offline.</string>
+    <string name="cd_search">Search saved projects</string>
+    <string name="cd_usage_pill">Daily API usage</string>
+    <string name="cd_theme_toggle">Toggle light or dark theme</string>
+    <string name="cd_settings">Open settings</string>
+    <string name="cd_add_project">New transcription or conversion</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_download_audio">Download extracted audio</string>
+    <string name="cd_play_pause">Play or pause audio</string>
+    <string name="cd_project_menu">Project options</string>
+    <string name="cd_find_replace">Find and replace</string>
+    <string name="cd_close">Close</string>
+    <string name="cd_copy">Copy to clipboard</string>
+    <string name="about_version">v2.0.0</string>
+    <string name="about_description">ordieo is an audio converter, AI transcriber, and on-device video compressor with offline audio extraction, built-in voice recorder, live active-word SRT preview, and Romanized Hinglish conversion.</string>
+    <string name="about_privacy_title">100% Local &amp; Private</string>
+    <string name="about_privacy_body">All API keys, audio files, custom dictionary entries, and transcripts stay strictly on your device. Requests go directly to your chosen AI provider with no intermediary servers.</string>
+</resources>
