@@ -100,6 +100,7 @@ fun TranscribeApp(
     val pendingQueue by viewModel.pendingQueue.collectAsStateWithLifecycle()
     val isRetryingQueue by viewModel.isRetryingQueue.collectAsStateWithLifecycle()
     val compressState by viewModel.compressState.collectAsStateWithLifecycle()
+    val splitState by viewModel.splitState.collectAsStateWithLifecycle()
     val showMissingApiKeyDialog by viewModel.showMissingApiKeyDialog.collectAsStateWithLifecycle()
     val remoteConfig by viewModel.remoteConfig.collectAsStateWithLifecycle()
     val updatePrompt by viewModel.updatePrompt.collectAsStateWithLifecycle()
@@ -185,6 +186,14 @@ fun TranscribeApp(
     ) { uri ->
         if (uri != null) {
             viewModel.selectCompressFile(uri)
+        }
+    }
+
+    val splitVideoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.selectSplitVideo(uri)
         }
     }
 
@@ -318,6 +327,7 @@ fun TranscribeApp(
                     ActiveScreen.COMPRESS -> {
                         CompressScreen(
                             state = compressState,
+                            splitState = splitState,
                             onBack = { showCompressScreen = false },
                             onSelectMediaType = { viewModel.setCompressMediaType(it) },
                             onPickFile = {
@@ -339,7 +349,26 @@ fun TranscribeApp(
                                 viewModel.useCompressedForTranscription {
                                     showCompressScreen = false
                                 }
-                            }
+                            },
+                            onPickSplitVideo = {
+                                splitVideoPickerLauncher.launch(
+                                    arrayOf("video/mp4", "video/quicktime", "video/webm", "video/*")
+                                )
+                            },
+                            onSelectSplitDurationPreset = { viewModel.setSplitDurationPreset(it) },
+                            onChangeSplitCustomDuration = { viewModel.setSplitCustomDuration(it) },
+                            onSelectSplitCustomUnit = { viewModel.setSplitCustomUnit(it) },
+                            onToggleSplitPartSelected = { viewModel.toggleSplitPartSelected(it) },
+                            onToggleSelectAllSplitParts = { viewModel.toggleSelectAllSplitParts() },
+                            onToggleSplitCompress = { viewModel.setSplitCompressEnabled(it) },
+                            onSelectSplitVideoPreset = { viewModel.setSplitVideoPreset(it) },
+                            onToggleSplitFixHdr = { viewModel.setSplitFixHdr(it) },
+                            onStartSplitExport = { viewModel.startSplitExport() },
+                            onSkipCurrentSplitPart = { viewModel.skipCurrentSplitPart() },
+                            onSkipQueuedSplitPart = { viewModel.skipQueuedSplitPart(it) },
+                            onCancelAllSplitExports = { viewModel.cancelAllSplitExports() },
+                            onShareSplitPart = { viewModel.shareSavedSplitPart(it) },
+                            onShareAllSavedSplitParts = { viewModel.shareAllSavedSplitParts() }
                         )
                     }
 

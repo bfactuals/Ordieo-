@@ -134,6 +134,91 @@ object LocalFileSaver {
     }
 
     /**
+     * Commits a finished video split clip immediately into Movies/Ordieo_Splits/ via MediaStore
+     * (API 29+, zero storage permissions required) or external Movies dir on API < 29.
+     * Cleans up pending MediaStore entries on failure so partial files never appear in Gallery.
+     */
+    suspend fun saveVideoToMoviesSplits(
+        context: Context,
+        sourceFile: File,
+        fileName: String
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!sourceFile.exists() || sourceFile.length() <= 0L) {
+                error("Split clip file is empty or missing.")
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = context.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Ordieo_Splits")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: error("Could not create Gallery entry in Movies/Ordieo_Splits")
+                try {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        sourceFile.inputStream().use { input -> input.copyTo(out) }
+                    } ?: error("Could not open Gallery output stream")
+                    values.clear()
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    uri
+                } catch (e: Exception) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw e
+                }
+            } else {
+                val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Ordieo_Splits")
+                    .apply { if (!exists()) mkdirs() }
+                val dest = File(dir, fileName)
+                sourceFile.copyTo(dest, overwrite = true)
+                val authority = "${context.packageName}.fileprovider"
+                FileProvider.getUriForFile(context, authority, dest)
+            }
+        }
+    }
+
+    /**
+     * Shares one or multiple content URIs (e.g., MediaStore Movies clips or FileProvider URIs)
+     * via the native Android Share Sheet with proper ClipData read-permission grants.
+     */
+    fun shareMediaUris(
+        context: Context,
+        uris: List<Uri>,
+        mimeType: String = "video/mp4",
+        chooserTitle: String = "Share Split Clips"
+    ): Result<Unit> = runCatching {
+        if (uris.isEmpty()) error("No saved clips available to share.")
+        val uriList = ArrayList(uris)
+        val shareIntent = if (uriList.size == 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, uriList.first())
+                clipData = android.content.ClipData.newRawUri("Split Clip", uriList.first())
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        } else {
+            val clip = android.content.ClipData.newRawUri("Split Clips", uriList.first()).apply {
+                for (i in 1 until uriList.size) {
+                    addItem(android.content.ClipData.Item(uriList[i]))
+                }
+            }
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = mimeType
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uriList)
+                clipData = clip
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        val chooser = Intent.createChooser(shareIntent, chooserTitle).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(chooser)
+    }
+
+    /**
      * Creates a temporary export file in cacheDir/exports/ and launches the native Share Sheet.
      */
     fun shareTextFile(

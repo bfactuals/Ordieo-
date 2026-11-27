@@ -123,7 +123,8 @@ enum class TextCasing(val label: String) {
 
 enum class CompressMediaType(val label: String) {
     VIDEO("Video"),
-    AUDIO("Audio")
+    AUDIO("Audio"),
+    SPLIT("Split")
 }
 
 enum class VideoCompressPreset(
@@ -224,6 +225,79 @@ data class CompressUiState(
     val statusText: String = "",
     val result: CompressedResult? = null
 )
+
+enum class SplitDurationPreset(val label: String, val durationMs: Long?) {
+    ONE_MIN("1 min", 60_000L),
+    TWO_MIN("2 min", 120_000L),
+    FIVE_MIN("5 min", 300_000L),
+    CUSTOM("Custom", null)
+}
+
+enum class CustomDurationUnit(val label: String, val multiplierMs: Long) {
+    SECONDS("sec", 1_000L),
+    MINUTES("min", 60_000L)
+}
+
+enum class SplitPartStatus {
+    IDLE,
+    QUEUED,
+    EXPORTING,
+    SAVED,
+    SKIPPED,
+    FAILED,
+    CANCELLED
+}
+
+data class SplitPartItem(
+    val index: Int,
+    val startMs: Long,
+    val endMs: Long,
+    val selected: Boolean = true,
+    val status: SplitPartStatus = SplitPartStatus.IDLE,
+    val progress: Float = 0f,
+    val savedUriString: String? = null,
+    val savedFileName: String? = null,
+    val outputSizeBytes: Long = 0L,
+    val errorMessage: String? = null
+) {
+    val durationMs: Long
+        get() = (endMs - startMs).coerceAtLeast(0L)
+}
+
+data class SplitUiState(
+    val selectedVideo: PickedMediaInfo? = null,
+    val durationPreset: SplitDurationPreset = SplitDurationPreset.ONE_MIN,
+    val customDurationInput: String = "30",
+    val customDurationUnit: CustomDurationUnit = CustomDurationUnit.SECONDS,
+    val parts: List<SplitPartItem> = emptyList(),
+    val compressWhileExporting: Boolean = false,
+    val videoPreset: VideoCompressPreset = VideoCompressPreset.FOR_AI_ULTRA_SMALL,
+    val fixHdrColors: Boolean = true,
+    val isExporting: Boolean = false,
+    val currentExportingPartIndex: Int? = null,
+    val currentExportOrdinal: Int = 0,
+    val totalQueuedCount: Int = 0,
+    val currentPartProgress: Float = 0f,
+    val currentStatusText: String = ""
+) {
+    val selectedCount: Int
+        get() = parts.count { it.selected }
+
+    val allSelected: Boolean
+        get() = parts.isNotEmpty() && parts.all { it.selected }
+
+    val savedParts: List<SplitPartItem>
+        get() = parts.filter { it.status == SplitPartStatus.SAVED && !it.savedUriString.isNullOrBlank() }
+
+    val effectiveChunkDurationMs: Long
+        get() = when (durationPreset) {
+            SplitDurationPreset.CUSTOM -> {
+                val parsed = customDurationInput.trim().toLongOrNull()?.coerceAtLeast(1L) ?: 30L
+                (parsed * customDurationUnit.multiplierMs).coerceIn(5_000L, 6L * 60L * 60L * 1000L)
+            }
+            else -> durationPreset.durationMs ?: 60_000L
+        }
+}
 
 enum class PendingJobType(val label: String) {
     TRANSCRIBE("Transcription"),

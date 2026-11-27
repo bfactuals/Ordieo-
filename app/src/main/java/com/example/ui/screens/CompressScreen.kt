@@ -50,6 +50,10 @@ import com.example.data.media.MediaCompressor
 import com.example.data.model.AudioCompressPreset
 import com.example.data.model.CompressMediaType
 import com.example.data.model.CompressUiState
+import com.example.data.model.CustomDurationUnit
+import com.example.data.model.SplitDurationPreset
+import com.example.data.model.SplitPartItem
+import com.example.data.model.SplitUiState
 import com.example.data.model.VideoCompressPreset
 import com.example.data.srt.SrtEngine
 import com.example.ui.components.AppToggleSwitch
@@ -65,6 +69,7 @@ import kotlin.math.roundToInt
 @Composable
 fun CompressScreen(
     state: CompressUiState,
+    splitState: SplitUiState,
     onBack: () -> Unit,
     onSelectMediaType: (CompressMediaType) -> Unit,
     onPickFile: () -> Unit,
@@ -75,10 +80,31 @@ fun CompressScreen(
     onCancelCompress: () -> Unit,
     onSaveDownload: () -> Unit,
     onShareResult: () -> Unit,
-    onUseForTranscription: () -> Unit
+    onUseForTranscription: () -> Unit,
+    onPickSplitVideo: () -> Unit,
+    onSelectSplitDurationPreset: (SplitDurationPreset) -> Unit,
+    onChangeSplitCustomDuration: (String) -> Unit,
+    onSelectSplitCustomUnit: (CustomDurationUnit) -> Unit,
+    onToggleSplitPartSelected: (Int) -> Unit,
+    onToggleSelectAllSplitParts: () -> Unit,
+    onToggleSplitCompress: (Boolean) -> Unit,
+    onSelectSplitVideoPreset: (VideoCompressPreset) -> Unit,
+    onToggleSplitFixHdr: (Boolean) -> Unit,
+    onStartSplitExport: () -> Unit,
+    onSkipCurrentSplitPart: () -> Unit,
+    onSkipQueuedSplitPart: (Int) -> Unit,
+    onCancelAllSplitExports: () -> Unit,
+    onShareSplitPart: (SplitPartItem) -> Unit,
+    onShareAllSavedSplitParts: () -> Unit
 ) {
+    val isBusy = state.isCompressing || splitState.isExporting
+
     BackHandler {
-        if (state.isCompressing) onCancelCompress() else onBack()
+        when {
+            state.isCompressing -> onCancelCompress()
+            splitState.isExporting -> onCancelAllSplitExports()
+            else -> onBack()
+        }
     }
 
     val colors = TranscribeThemeTokens.colors
@@ -88,6 +114,7 @@ fun CompressScreen(
         when (state.mediaType) {
             CompressMediaType.VIDEO -> MediaCompressor.estimateVideoBytes(media, state.videoPreset)
             CompressMediaType.AUDIO -> MediaCompressor.estimateAudioBytes(media, state.audioPreset)
+            CompressMediaType.SPLIT -> 0L
         }
     } else 0L
 
@@ -114,7 +141,11 @@ fun CompressScreen(
             ) {
                 IconButton(
                     onClick = {
-                        if (state.isCompressing) onCancelCompress() else onBack()
+                        when {
+                            state.isCompressing -> onCancelCompress()
+                            splitState.isExporting -> onCancelAllSplitExports()
+                            else -> onBack()
+                        }
                     },
                     modifier = Modifier
                         .size(44.dp)
@@ -128,12 +159,16 @@ fun CompressScreen(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Compress",
+                        text = if (state.mediaType == CompressMediaType.SPLIT) "Compress & Split" else "Compress",
                         style = TranscribeTextStyles.ScreenTitle,
                         color = colors.text
                     )
                     Text(
-                        text = "100% on-device native media compression",
+                        text = if (state.mediaType == CompressMediaType.SPLIT) {
+                            "Instant lossless cutter · Saves to Movies/Ordieo_Splits"
+                        } else {
+                            "100% on-device hardware-accelerated media tools"
+                        },
                         style = TranscribeTextStyles.SubText,
                         color = colors.muted
                     )
@@ -147,7 +182,7 @@ fun CompressScreen(
                 contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 4.dp, bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Video | Audio Segment Control
+                // Video | Audio | Split Segment Control
                 item(key = "compress_segment") {
                     Row(
                         modifier = Modifier
@@ -166,7 +201,7 @@ fun CompressScreen(
                                     .height(40.dp)
                                     .clip(RoundedCornerShape(99.dp))
                                     .background(if (selected) colors.accent else Color.Transparent)
-                                    .clickable(enabled = !state.isCompressing) { onSelectMediaType(type) }
+                                    .clickable(enabled = !isBusy) { onSelectMediaType(type) }
                                     .testTag("compress_type_${type.name.lowercase()}"),
                                 contentAlignment = Alignment.Center
                             ) {
@@ -182,6 +217,24 @@ fun CompressScreen(
                     }
                 }
 
+                if (state.mediaType == CompressMediaType.SPLIT) {
+                    splitTabItems(
+                        splitState = splitState,
+                        onPickVideo = onPickSplitVideo,
+                        onSelectDurationPreset = onSelectSplitDurationPreset,
+                        onChangeCustomDuration = onChangeSplitCustomDuration,
+                        onSelectCustomUnit = onSelectSplitCustomUnit,
+                        onTogglePartSelected = onToggleSplitPartSelected,
+                        onToggleSelectAll = onToggleSelectAllSplitParts,
+                        onToggleCompressWhileExporting = onToggleSplitCompress,
+                        onSelectVideoPreset = onSelectSplitVideoPreset,
+                        onToggleFixHdr = onToggleSplitFixHdr,
+                        onSkipCurrentPart = onSkipCurrentSplitPart,
+                        onSkipQueuedPart = onSkipQueuedSplitPart,
+                        onCancelAll = onCancelAllSplitExports,
+                        onSharePart = onShareSplitPart
+                    )
+                } else {
                 // File Info Card or Pick File Card
                 item(key = "compress_file_card") {
                     if (media == null) {
@@ -593,15 +646,24 @@ fun CompressScreen(
                         }
                     }
                 }
+                }
             }
 
-            // Bottom Action Bar: Compress / Cancel
+            // Bottom Action Bar: Compress / Cancel OR Split Export Controls
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 18.dp, vertical = 14.dp)
             ) {
-                if (state.isCompressing) {
+                if (state.mediaType == CompressMediaType.SPLIT) {
+                    SplitBottomActionBar(
+                        splitState = splitState,
+                        onStartExport = onStartSplitExport,
+                        onSkipCurrentPart = onSkipCurrentSplitPart,
+                        onCancelAll = onCancelAllSplitExports,
+                        onShareAllSaved = onShareAllSavedSplitParts
+                    )
+                } else if (state.isCompressing) {
                     SecondaryActionButton(
                         onClick = onCancelCompress,
                         borderColor = colors.danger,
@@ -643,7 +705,7 @@ fun CompressScreen(
 }
 
 @Composable
-private fun PresetRadioCard(
+internal fun PresetRadioCard(
     title: String,
     subtitle: String,
     estimateText: String?,

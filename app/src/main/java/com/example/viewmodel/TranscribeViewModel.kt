@@ -12,6 +12,7 @@ import com.example.data.media.LocalFileSaver
 import com.example.data.media.MediaCompressor
 import com.example.data.media.PlaybackState
 import com.example.data.media.RecordingState
+import com.example.data.media.VideoSplitter
 import com.example.data.media.VoiceRecorderController
 import com.example.data.model.AiProvider
 import com.example.data.model.AppSettings
@@ -19,6 +20,7 @@ import com.example.data.model.AudioCompressPreset
 import com.example.data.model.AudioSaveBehavior
 import com.example.data.model.CompressMediaType
 import com.example.data.model.CompressUiState
+import com.example.data.model.CustomDurationUnit
 import com.example.data.model.DailyUsage
 import com.example.data.model.GeminiModelOption
 import com.example.data.model.LanguageMode
@@ -29,6 +31,10 @@ import com.example.data.model.ProcessingOverlayState
 import com.example.data.model.ProcessingStep
 import com.example.data.model.ProjectModel
 import com.example.data.model.RetentionOption
+import com.example.data.model.SplitDurationPreset
+import com.example.data.model.SplitPartItem
+import com.example.data.model.SplitPartStatus
+import com.example.data.model.SplitUiState
 import com.example.data.model.StorageStats
 import com.example.data.model.TextCasing
 import com.example.data.model.ThemeMode
@@ -132,7 +138,18 @@ class TranscribeViewModel(application: Application) : AndroidViewModel(applicati
     private val _compressState = MutableStateFlow(CompressUiState())
     val compressState: StateFlow<CompressUiState> = _compressState.asStateFlow()
 
+    private val _splitState = MutableStateFlow(SplitUiState())
+    val splitState: StateFlow<SplitUiState> = _splitState.asStateFlow()
+
     private var compressJob: Job? = null
+    private var splitQueueJob: Job? = null
+    private var activeSplitPartJob: Job? = null
+
+    @Volatile
+    private var skipRequestedForPartIndex: Int? = null
+
+    @Volatile
+    private var cancelAllSplitsRequested: Boolean = false
 
     private val _showMissingApiKeyDialog = MutableStateFlow(false)
     val showMissingApiKeyDialog: StateFlow<Boolean> = _showMissingApiKeyDialog.asStateFlow()
@@ -1435,23 +1452,35 @@ class TranscribeViewModel(application: Application) : AndroidViewModel(applicati
 
     // --- Native Media Compression ---
 
-    fun syncCompressDefaultsFromSettings() {
+    fun syncCompressDefaultsFromSettings(initialTab: CompressMediaType? = null) {
         val s = settings.value
         _compressState.update { state ->
             if (state.isCompressing) state
             else state.copy(
+                mediaType = initialTab ?: state.mediaType,
                 videoPreset = s.defaultVideoPreset,
                 fixHdrColors = s.defaultFixHdr,
                 audioPreset = s.defaultAudioPreset
             )
         }
+        _splitState.update { state ->
+            if (state.isExporting) state
+            else state.copy(
+                videoPreset = s.defaultVideoPreset,
+                fixHdrColors = s.defaultFixHdr
+            )
+        }
     }
 
     fun setCompressMediaType(type: CompressMediaType) {
-        if (_compressState.value.isCompressing) return
+        if (_compressState.value.isCompressing || _splitState.value.isExporting) return
         _compressState.update {
             if (it.mediaType == type) it
-            else it.copy(mediaType = type, selectedMedia = null, result = null, progress = 0f, statusText = "")
+            else if (type == CompressMediaType.SPLIT) {
+                it.copy(mediaType = type)
+            } else {
+                it.copy(mediaType = type, selectedMedia = null, result = null, progress = 0f, statusText = "")
+            }
         }
     }
 
@@ -1576,6 +1605,433 @@ class TranscribeViewModel(application: Application) : AndroidViewModel(applicati
         onOpened()
     }
 
+    // --- Instant Video Splitter (Sequential Queue + Commit-Per-Part + Skip + Cancel All) ---
+
+    fun selectSplitVideo(uri: Uri) {
+        if (_splitState.value.isExporting) return
+        viewModelScope.launch {
+            val info = MediaCompressor.probeMedia(appContext, uri)
+            _splitState.update { current ->
+                val parts = VideoSplitter.buildSplitParts(info.durationMs, current.effectiveChunkDurationMs)
+                current.copy(
+                    selectedVideo = info,
+                    parts = parts,
+                    currentExportingPartIndex = null,
+                    currentExportOrdinal = 0,
+                    totalQueuedCount = 0,
+                    currentPartProgress = 0f,
+                    currentStatusText = ""
+                )
+            }
+        }
+    }
+
+    fun setSplitDurationPreset(preset: SplitDurationPreset) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { current ->
+            val updated = current.copy(durationPreset = preset)
+            val video = updated.selectedVideo
+            if (video != null) {
+                updated.copy(
+                    parts = VideoSplitter.buildSplitParts(video.durationMs, updated.effectiveChunkDurationMs)
+                )
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun setSplitCustomDuration(rawInput: String) {
+        if (_splitState.value.isExporting) return
+        val filtered = rawInput.filter { it.isDigit() }.take(4)
+        _splitState.update { current ->
+            val updated = current.copy(customDurationInput = filtered)
+            val video = updated.selectedVideo
+            if (video != null && updated.durationPreset == SplitDurationPreset.CUSTOM) {
+                updated.copy(
+                    parts = VideoSplitter.buildSplitParts(video.durationMs, updated.effectiveChunkDurationMs)
+                )
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun setSplitCustomUnit(unit: CustomDurationUnit) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { current ->
+            val updated = current.copy(customDurationUnit = unit)
+            val video = updated.selectedVideo
+            if (video != null && updated.durationPreset == SplitDurationPreset.CUSTOM) {
+                updated.copy(
+                    parts = VideoSplitter.buildSplitParts(video.durationMs, updated.effectiveChunkDurationMs)
+                )
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun toggleSplitPartSelected(partIndex: Int) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { current ->
+            current.copy(
+                parts = current.parts.map { part ->
+                    if (part.index == partIndex) part.copy(selected = !part.selected) else part
+                }
+            )
+        }
+    }
+
+    fun toggleSelectAllSplitParts() {
+        if (_splitState.value.isExporting) return
+        _splitState.update { current ->
+            val targetSelected = !current.allSelected
+            current.copy(
+                parts = current.parts.map { it.copy(selected = targetSelected) }
+            )
+        }
+    }
+
+    fun setSplitCompressEnabled(enabled: Boolean) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { it.copy(compressWhileExporting = enabled) }
+    }
+
+    fun setSplitVideoPreset(preset: VideoCompressPreset) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { it.copy(videoPreset = preset) }
+    }
+
+    fun setSplitFixHdr(enabled: Boolean) {
+        if (_splitState.value.isExporting) return
+        _splitState.update { it.copy(fixHdrColors = enabled) }
+    }
+
+    /**
+     * Exports all selected split parts STRICTLY SEQUENTIALLY, one by one.
+     * Commits each completed part immediately to MediaStore (`Movies/Ordieo_Splits/`)
+     * and marks it SAVED before starting the next part.
+     */
+    fun startSplitExport() {
+        val snapshot = _splitState.value
+        val video = snapshot.selectedVideo
+        if (video == null) {
+            _toastEvents.tryEmit(ToastEvent.Error("Select a video to split first"))
+            return
+        }
+        val selectedIndices = snapshot.parts.filter { it.selected }.map { it.index }
+        if (selectedIndices.isEmpty()) {
+            _toastEvents.tryEmit(ToastEvent.Error("Select at least one part to export"))
+            return
+        }
+        if (snapshot.isExporting) return
+
+        cancelAllSplitsRequested = false
+        skipRequestedForPartIndex = null
+        splitQueueJob?.cancel()
+
+        // Mark selected parts as QUEUED (resetting any prior non-saved statuses for this batch;
+        // unselected parts return to IDLE unless already saved in this session)
+        val selectedSet = selectedIndices.toSet()
+        _splitState.update { current ->
+            current.copy(
+                isExporting = true,
+                currentExportingPartIndex = null,
+                currentExportOrdinal = 0,
+                totalQueuedCount = selectedIndices.size,
+                currentPartProgress = 0f,
+                currentStatusText = "Starting export...",
+                parts = current.parts.map { part ->
+                    if (part.index in selectedSet) {
+                        part.copy(
+                            status = SplitPartStatus.QUEUED,
+                            progress = 0f,
+                            errorMessage = null
+                        )
+                    } else if (part.status == SplitPartStatus.SAVED) {
+                        part
+                    } else {
+                        part.copy(status = SplitPartStatus.IDLE, progress = 0f, errorMessage = null)
+                    }
+                }
+            )
+        }
+
+        val compressEnabled = snapshot.compressWhileExporting
+        val preset = snapshot.videoPreset
+        val fixHdr = snapshot.fixHdrColors
+        val totalPartsInVideo = snapshot.parts.size
+
+        splitQueueJob = viewModelScope.launch {
+            var savedInRun = 0
+            var skippedInRun = 0
+            var failedInRun = 0
+
+            try {
+                for ((ordinalIdx, partIndex) in selectedIndices.withIndex()) {
+                    if (cancelAllSplitsRequested) break
+
+                    // Re-read live state in case the user pre-skipped this queued part while an earlier part ran
+                    val livePart = _splitState.value.parts.firstOrNull { it.index == partIndex } ?: continue
+                    if (livePart.status == SplitPartStatus.SKIPPED) {
+                        skippedInRun++
+                        continue
+                    }
+
+                    skipRequestedForPartIndex = null
+                    val ordinal = ordinalIdx + 1
+
+                    _splitState.update { current ->
+                        current.copy(
+                            currentExportingPartIndex = partIndex,
+                            currentExportOrdinal = ordinal,
+                            currentPartProgress = 0.02f,
+                            currentStatusText = if (compressEnabled) "Compressing..." else "Splitting...",
+                            parts = current.parts.map { p ->
+                                if (p.index == partIndex) {
+                                    p.copy(status = SplitPartStatus.EXPORTING, progress = 0.02f, errorMessage = null)
+                                } else p
+                            }
+                        )
+                    }
+
+                    var partResult: com.example.data.media.SplitExportedPart? = null
+                    var partError: Throwable? = null
+
+                    // Run each part in a dedicated child job so "Skip this part" cancels ONLY this part
+                    val partJob = launch {
+                        try {
+                            partResult = VideoSplitter.exportSinglePart(
+                                context = appContext,
+                                video = video,
+                                part = livePart,
+                                totalParts = totalPartsInVideo,
+                                compressWhileExporting = compressEnabled,
+                                videoPreset = preset,
+                                fixHdrColors = fixHdr,
+                                onProgress = { pct, status ->
+                                    _splitState.update { current ->
+                                        current.copy(
+                                            currentPartProgress = pct,
+                                            currentStatusText = status,
+                                            parts = current.parts.map { p ->
+                                                if (p.index == partIndex) p.copy(progress = pct) else p
+                                            }
+                                        )
+                                    }
+                                }
+                            )
+                        } catch (e: Throwable) {
+                            partError = e
+                        }
+                    }
+                    activeSplitPartJob = partJob
+                    partJob.join()
+                    activeSplitPartJob = null
+
+                    when {
+                        cancelAllSplitsRequested -> {
+                            // Never touch already-saved parts; mark current incomplete part as CANCELLED
+                            _splitState.update { current ->
+                                current.copy(
+                                    parts = current.parts.map { p ->
+                                        if (p.index == partIndex && p.status != SplitPartStatus.SAVED) {
+                                            p.copy(status = SplitPartStatus.CANCELLED, progress = 0f)
+                                        } else p
+                                    }
+                                )
+                            }
+                            break
+                        }
+
+                        skipRequestedForPartIndex == partIndex -> {
+                            skippedInRun++
+                            skipRequestedForPartIndex = null
+                            _splitState.update { current ->
+                                current.copy(
+                                    parts = current.parts.map { p ->
+                                        if (p.index == partIndex) {
+                                            p.copy(status = SplitPartStatus.SKIPPED, progress = 0f, errorMessage = null)
+                                        } else p
+                                    }
+                                )
+                            }
+                        }
+
+                        partResult != null -> {
+                            val committed = partResult!!
+                            savedInRun++
+                            _splitState.update { current ->
+                                current.copy(
+                                    parts = current.parts.map { p ->
+                                        if (p.index == partIndex) {
+                                            p.copy(
+                                                status = SplitPartStatus.SAVED,
+                                                progress = 1f,
+                                                savedUriString = committed.savedUri.toString(),
+                                                savedFileName = committed.fileName,
+                                                outputSizeBytes = committed.outputSizeBytes,
+                                                errorMessage = null
+                                            )
+                                        } else p
+                                    }
+                                )
+                            }
+                        }
+
+                        else -> {
+                            if (partError is CancellationException && !cancelAllSplitsRequested) {
+                                // Cancelled unexpectedly without skip/cancel flags
+                                skippedInRun++
+                                _splitState.update { current ->
+                                    current.copy(
+                                        parts = current.parts.map { p ->
+                                            if (p.index == partIndex) {
+                                                p.copy(status = SplitPartStatus.SKIPPED, progress = 0f)
+                                            } else p
+                                        }
+                                    )
+                                }
+                            } else {
+                                failedInRun++
+                                val errMsg = partError?.message ?: "Export failed"
+                                _splitState.update { current ->
+                                    current.copy(
+                                        parts = current.parts.map { p ->
+                                            if (p.index == partIndex) {
+                                                p.copy(
+                                                    status = SplitPartStatus.FAILED,
+                                                    progress = 0f,
+                                                    errorMessage = errMsg
+                                                )
+                                            } else p
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                activeSplitPartJob = null
+                val wasCancelled = cancelAllSplitsRequested
+                _splitState.update { current ->
+                    current.copy(
+                        isExporting = false,
+                        currentExportingPartIndex = null,
+                        currentPartProgress = 0f,
+                        currentStatusText = "",
+                        parts = current.parts.map { p ->
+                            if (wasCancelled && (p.status == SplitPartStatus.QUEUED || p.status == SplitPartStatus.EXPORTING)) {
+                                p.copy(status = SplitPartStatus.CANCELLED, progress = 0f)
+                            } else p
+                        }
+                    )
+                }
+
+                val totalSavedNow = _splitState.value.savedParts.size
+                val summary = when {
+                    wasCancelled -> {
+                        if (totalSavedNow > 0) {
+                            val noun = if (totalSavedNow == 1) "part remains" else "parts remain"
+                            "Cancelled. $totalSavedNow completed $noun saved in Gallery."
+                        } else {
+                            "Split export cancelled."
+                        }
+                    }
+                    failedInRun > 0 -> "Done! $savedInRun saved, $skippedInRun skipped, $failedInRun failed."
+                    skippedInRun > 0 -> "Done! $savedInRun saved, $skippedInRun skipped."
+                    else -> {
+                        val noun = if (savedInRun == 1) "part" else "parts"
+                        "Done! $savedInRun $noun saved to Movies/Ordieo_Splits."
+                    }
+                }
+                _toastEvents.tryEmit(
+                    if (failedInRun > 0 && savedInRun == 0) ToastEvent.Error(summary)
+                    else ToastEvent.Info(summary)
+                )
+            }
+        }
+    }
+
+    /**
+     * Cancels ONLY the currently exporting part (its incomplete temp file is deleted)
+     * and immediately lets the sequential queue advance to the next part.
+     */
+    fun skipCurrentSplitPart() {
+        val currentIndex = _splitState.value.currentExportingPartIndex ?: return
+        skipRequestedForPartIndex = currentIndex
+        activeSplitPartJob?.cancel()
+    }
+
+    /**
+     * Allows skipping either the currently exporting part OR any upcoming queued part
+     * before it even starts.
+     */
+    fun skipQueuedSplitPart(partIndex: Int) {
+        val state = _splitState.value
+        if (!state.isExporting) return
+        if (state.currentExportingPartIndex == partIndex) {
+            skipCurrentSplitPart()
+            return
+        }
+        _splitState.update { current ->
+            current.copy(
+                parts = current.parts.map { part ->
+                    if (part.index == partIndex && part.status == SplitPartStatus.QUEUED) {
+                        part.copy(status = SplitPartStatus.SKIPPED, progress = 0f)
+                    } else part
+                }
+            )
+        }
+    }
+
+    /**
+     * Stops the currently exporting part and the rest of the queue immediately.
+     * NEVER deletes parts that were already committed/saved to MediaStore.
+     */
+    fun cancelAllSplitExports() {
+        if (!_splitState.value.isExporting) return
+        cancelAllSplitsRequested = true
+        activeSplitPartJob?.cancel()
+    }
+
+    fun shareSavedSplitPart(part: SplitPartItem) {
+        val uriStr = part.savedUriString
+        if (uriStr.isNullOrBlank()) {
+            _toastEvents.tryEmit(ToastEvent.Error("Part ${part.index} is not saved yet"))
+            return
+        }
+        val res = LocalFileSaver.shareMediaUris(
+            context = appContext,
+            uris = listOf(Uri.parse(uriStr)),
+            mimeType = "video/mp4",
+            chooserTitle = "Share Part ${part.index}"
+        )
+        if (res.isFailure) {
+            _toastEvents.tryEmit(ToastEvent.Error("Unable to open Share Sheet"))
+        }
+    }
+
+    fun shareAllSavedSplitParts() {
+        val saved = _splitState.value.savedParts
+        if (saved.isEmpty()) {
+            _toastEvents.tryEmit(ToastEvent.Error("No saved clips to share yet"))
+            return
+        }
+        val uris = saved.mapNotNull { it.savedUriString?.let(Uri::parse) }
+        val res = LocalFileSaver.shareMediaUris(
+            context = appContext,
+            uris = uris,
+            mimeType = "video/mp4",
+            chooserTitle = if (uris.size == 1) "Share Split Clip" else "Share ${uris.size} Split Clips"
+        )
+        if (res.isFailure) {
+            _toastEvents.tryEmit(ToastEvent.Error("Unable to open Share Sheet"))
+        }
+    }
+
     fun showToast(message: String, isError: Boolean = false) {
         _toastEvents.tryEmit(if (isError) ToastEvent.Error(message) else ToastEvent.Info(message))
     }
@@ -1598,6 +2054,9 @@ class TranscribeViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         super.onCleared()
         compressJob?.cancel()
+        cancelAllSplitsRequested = true
+        activeSplitPartJob?.cancel()
+        splitQueueJob?.cancel()
         audioPlayer.release()
         voiceRecorder.cancelRecording()
     }

@@ -1,7 +1,6 @@
 package com.example.data.media
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -11,13 +10,34 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
+import androidx.annotation.OptIn
+import androidx.media3.common.Effect
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.Presentation
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import com.example.data.model.AudioCompressPreset
 import com.example.data.model.CompressMediaType
 import com.example.data.model.CompressedResult
 import com.example.data.model.PickedMediaInfo
 import com.example.data.model.VideoCompressPreset
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -26,11 +46,14 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
 
 /**
  * 100% Native Android Media Compressor (zero FFmpeg).
- * Uses Android's MediaMetadataRetriever, MediaExtractor, MediaCodec, and MediaMuxer.
+ * Uses hardware-accelerated Media3 Transformer (H.264/AVC + OpenGL HDR-to-SDR tone mapping)
+ * for video compression, and Android MediaExtractor/MediaCodec/MediaMuxer for audio compression.
  */
 object MediaCompressor {
 
@@ -159,6 +182,15 @@ object MediaCompressor {
         }
     }
 
+    internal fun sanitizeBaseName(displayName: String, fallback: String = "video"): String {
+        return displayName
+            .substringBeforeLast('.')
+            .replace(Regex("""[^a-zA-Z0-9._\- ]"""), "_")
+            .trim()
+            .replace(' ', '_')
+            .ifBlank { fallback }
+    }
+
     suspend fun compressMedia(
         context: Context,
         mediaType: CompressMediaType,
@@ -169,11 +201,7 @@ object MediaCompressor {
         onProgress: (Float, String) -> Unit
     ): CompressedResult = withContext(Dispatchers.IO) {
         val uri = Uri.parse(info.uriString)
-        val safeBase = info.displayName
-            .substringBeforeLast('.')
-            .replace(Regex("""[^a-zA-Z0-9._\- ]"""), "_")
-            .trim()
-            .ifBlank { "compressed" }
+        val safeBase = sanitizeBaseName(info.displayName, fallback = "compressed")
         val stamp = System.currentTimeMillis() / 1000L
         val outDir = getCompressedStorageDir(context)
 
@@ -206,7 +234,8 @@ object MediaCompressor {
                     }
                 }
             }
-            CompressMediaType.VIDEO -> {
+            CompressMediaType.VIDEO,
+            CompressMediaType.SPLIT -> {
                 val suffix = when (videoPreset) {
                     VideoCompressPreset.FOR_AI_ULTRA_SMALL -> "480p_ai"
                     VideoCompressPreset.SMALL -> "720p_small"
@@ -214,7 +243,7 @@ object MediaCompressor {
                     VideoCompressPreset.BEST_QUALITY -> "high"
                 }
                 val outFile = File(outDir, "${safeBase}_${suffix}_$stamp.mp4")
-                compressVideoNative(
+                compressVideoWithTransformer(
                     context = context,
                     uri = uri,
                     info = info,
@@ -593,189 +622,169 @@ object MediaCompressor {
     }
 
     /**
-     * Native Android video compressor using MediaMetadataRetriever + MediaCodec H.264 encoder
-     * + MediaMuxer (re-encoding to standard SDR BT.709 when Fix HDR colours is enabled)
-     * while preserving the audio track cleanly.
+     * Hardware-accelerated Android video compressor powered by Media3 Transformer.
+     * Targets the device's hardware H.264 (video/avc) encoder with preset bitrate/resolution,
+     * optional OpenGL HDR-to-SDR tone-mapping, and optional ClippingConfiguration for split exports.
      */
-    private suspend fun compressVideoNative(
+    @OptIn(UnstableApi::class)
+    internal suspend fun compressVideoWithTransformer(
         context: Context,
         uri: Uri,
         info: PickedMediaInfo,
         preset: VideoCompressPreset,
         fixHdrColors: Boolean,
         outputFile: File,
+        clipStartMs: Long? = null,
+        clipEndMs: Long? = null,
         onProgress: (Float, String) -> Unit
     ) {
-        onProgress(0.04f, "Preparing video encoder...")
-        val srcW = info.width.takeIf { it > 0 } ?: 1280
-        val srcH = info.height.takeIf { it > 0 } ?: 720
-        val isPortrait = srcH > srcW
-        val targetShortEdge = preset.targetHeight.coerceAtMost(minOf(srcW, srcH).coerceAtLeast(320))
-        val scale = targetShortEdge.toFloat() / minOf(srcW, srcH).coerceAtLeast(1).toFloat()
-        val outW = (((srcW * scale).roundToInt() / 16) * 16).coerceAtLeast(320)
-        val outH = (((srcH * scale).roundToInt() / 16) * 16).coerceAtLeast(240)
-        val fps = if (preset == VideoCompressPreset.FOR_AI_ULTRA_SMALL) 15 else 24
+        onProgress(0.02f, "Starting hardware encoder...")
+        outputFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
+        if (outputFile.exists()) {
+            runCatching { outputFile.delete() }
+        }
 
-        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, preset.videoBitrateKbps * 1000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-            if (fixHdrColors && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+        val srcW = info.width
+        val srcH = info.height
+        val srcShortSide = if (srcW > 0 && srcH > 0) minOf(srcW, srcH) else 0
+        val effectiveTargetShortSide = if (srcShortSide > 0) {
+            preset.targetHeight.coerceAtMost(srcShortSide)
+        } else {
+            preset.targetHeight
+        }
+
+        val videoEffects = buildList<Effect> {
+            // Downscale proportionally by short side (handles both portrait & landscape without upscaling)
+            if (srcShortSide == 0 || srcShortSide > preset.targetHeight) {
+                add(Presentation.createForShortSide(preset.targetHeight))
             }
         }
 
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        val retriever = MediaMetadataRetriever()
-        val audioExtractor = MediaExtractor()
-        var muxerStarted = false
-        var videoTrackIndex = -1
-        var audioTrackIndex = -1
-        var hasCompatibleAudio = false
-        var sourceAudioFormat: MediaFormat? = null
+        val mediaItem = if (clipStartMs != null && clipEndMs != null && clipEndMs > clipStartMs) {
+            MediaItem.Builder()
+                .setUri(uri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(clipStartMs.coerceAtLeast(0L))
+                        .setEndPositionMs(clipEndMs)
+                        .build()
+                )
+                .build()
+        } else {
+            MediaItem.fromUri(uri)
+        }
+        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+            .setEffects(Effects(/* audioProcessors = */ emptyList(), /* videoEffects = */ videoEffects))
+            .build()
 
-        try {
-            // Inspect source audio track to mux alongside compressed video
-            runCatching {
-                context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                    audioExtractor.setDataSource(pfd.fileDescriptor)
-                    for (i in 0 until audioExtractor.trackCount) {
-                        val f = audioExtractor.getTrackFormat(i)
-                        val m = f.getString(MediaFormat.KEY_MIME).orEmpty()
-                        if (m.startsWith("audio/mp4a") || m.startsWith("audio/aac")) {
-                            audioExtractor.selectTrack(i)
-                            sourceAudioFormat = f
-                            hasCompatibleAudio = true
-                            break
+        val sequence = EditedMediaItemSequence.Builder(editedMediaItem).build()
+        val hdrMode = if (fixHdrColors) {
+            Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL
+        } else {
+            Composition.HDR_MODE_KEEP_HDR
+        }
+        val composition = Composition.Builder(sequence)
+            .setHdrMode(hdrMode)
+            .build()
+
+        val videoEncoderSettings = VideoEncoderSettings.Builder()
+            .setBitrate(preset.videoBitrateKbps * 1000)
+            .build()
+
+        val encoderFactory = DefaultEncoderFactory.Builder(context)
+            .setRequestedVideoEncoderSettings(videoEncoderSettings)
+            .setEnableFallback(true)
+            .build()
+
+        val statusLabel = if (fixHdrColors) {
+            "Compressing ${effectiveTargetShortSide}p H.264 SDR..."
+        } else {
+            "Compressing ${effectiveTargetShortSide}p H.264..."
+        }
+
+        // Media3 Transformer requires creation, start(), getProgress(), and cancel() on a single Looper thread.
+        withContext(Dispatchers.Main.immediate) {
+            var transformer: Transformer? = null
+            var progressJob: kotlinx.coroutines.Job? = null
+            try {
+                suspendCancellableCoroutine<Unit> { continuation ->
+                    val listener = object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            progressJob?.cancel()
+                            onProgress(1f, "Done")
+                            if (continuation.isActive) {
+                                continuation.resume(Unit)
+                            }
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            progressJob?.cancel()
+                            runCatching { outputFile.delete() }
+                            if (continuation.isActive) {
+                                val detail = exportException.message?.takeIf { it.isNotBlank() }
+                                    ?: exportException.errorCodeName
+                                continuation.resumeWithException(
+                                    IllegalStateException("Video compression failed: $detail", exportException)
+                                )
+                            }
                         }
                     }
-                }
-            }
 
-            encoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val inputSurface = encoder.createInputSurface()
-            encoder.start()
+                    val builtTransformer = Transformer.Builder(context)
+                        .setVideoMimeType(MimeTypes.VIDEO_H264)
+                        .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        .setEncoderFactory(encoderFactory)
+                        .addListener(listener)
+                        .build()
+                    transformer = builtTransformer
 
-            retriever.setDataSource(context, uri)
-            val durationMs = info.durationMs.coerceAtLeast(1000L)
-            val frameStepMs = (1000L / fps).coerceAtLeast(33L)
-            val totalFrames = (durationMs / frameStepMs).toInt().coerceIn(1, 3600)
-            val bufInfo = MediaCodec.BufferInfo()
+                    continuation.invokeOnCancellation {
+                        progressJob?.cancel()
+                        runCatching { builtTransformer.cancel() }
+                        runCatching { outputFile.delete() }
+                    }
 
-            fun drainEncoder(endOfStream: Boolean) {
-                if (endOfStream) {
-                    encoder.signalEndOfInputStream()
-                }
-                while (true) {
-                    val outIdx = encoder.dequeueOutputBuffer(bufInfo, if (endOfStream) 10_000L else 0L)
-                    when {
-                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                            if (!endOfStream) break
-                        }
-                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            if (!muxerStarted) {
-                                videoTrackIndex = muxer.addTrack(encoder.outputFormat)
-                                if (hasCompatibleAudio && sourceAudioFormat != null) {
-                                    audioTrackIndex = muxer.addTrack(sourceAudioFormat!!)
+                    builtTransformer.start(composition, outputFile.absolutePath)
+
+                    val progressHolder = ProgressHolder()
+                    progressJob = launch {
+                        while (isActive && continuation.isActive) {
+                            val state = runCatching { builtTransformer.getProgress(progressHolder) }
+                                .getOrDefault(Transformer.PROGRESS_STATE_NOT_STARTED)
+                            when (state) {
+                                Transformer.PROGRESS_STATE_AVAILABLE -> {
+                                    val fraction = (progressHolder.progress.coerceIn(0, 100) / 100f)
+                                        .coerceIn(0.03f, 0.99f)
+                                    onProgress(fraction, statusLabel)
                                 }
-                                muxer.start()
-                                muxerStarted = true
+                                Transformer.PROGRESS_STATE_WAITING_FOR_AVAILABILITY -> {
+                                    onProgress(0.05f, statusLabel)
+                                }
+                                Transformer.PROGRESS_STATE_UNAVAILABLE -> {
+                                    onProgress(0.25f, statusLabel)
+                                }
+                                Transformer.PROGRESS_STATE_NOT_STARTED -> break
                             }
-                        }
-                        outIdx >= 0 -> {
-                            val encoded = encoder.getOutputBuffer(outIdx)
-                            if (encoded != null && bufInfo.size > 0 && muxerStarted &&
-                                (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
-                            ) {
-                                encoded.position(bufInfo.offset)
-                                encoded.limit(bufInfo.offset + bufInfo.size)
-                                muxer.writeSampleData(videoTrackIndex, encoded, bufInfo)
-                            }
-                            encoder.releaseOutputBuffer(outIdx, false)
-                            if ((bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                            delay(100L)
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                progressJob?.cancel()
+                runCatching { transformer?.cancel() }
+                runCatching { outputFile.delete() }
+                throw e
+            } catch (e: Exception) {
+                progressJob?.cancel()
+                runCatching { outputFile.delete() }
+                throw e
+            } finally {
+                progressJob?.cancel()
             }
-
-            for (frameIdx in 0 until totalFrames) {
-                coroutineContext.ensureActive()
-                val timeUs = frameIdx * frameStepMs * 1000L
-                val bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                    retriever.getScaledFrameAtTime(
-                        timeUs,
-                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                        outW,
-                        outH
-                    )
-                } else {
-                    retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                }
-
-                if (bmp != null) {
-                    val canvas = inputSurface.lockCanvas(null)
-                    try {
-                        val destRect = android.graphics.Rect(0, 0, canvas.width, canvas.height)
-                        // Drawing ARGB_8888 bitmap onto SDR surface normalizes HDR tone mapping cleanly
-                        val sdrBitmap = if (bmp.config != Bitmap.Config.ARGB_8888) {
-                            bmp.copy(Bitmap.Config.ARGB_8888, false)
-                        } else bmp
-                        canvas.drawBitmap(sdrBitmap, null, destRect, null)
-                        if (sdrBitmap !== bmp) sdrBitmap.recycle()
-                    } finally {
-                        inputSurface.unlockCanvasAndPost(canvas)
-                        bmp.recycle()
-                    }
-                }
-                drainEncoder(false)
-
-                val pct = (frameIdx + 1).toFloat() / totalFrames.toFloat()
-                val label = if (fixHdrColors) {
-                    "Compressing ${if (isPortrait) outW else outH}p SDR..."
-                } else {
-                    "Compressing ${if (isPortrait) outW else outH}p..."
-                }
-                onProgress(0.05f + pct * 0.80f, label)
-            }
-
-            drainEncoder(true)
-            inputSurface.release()
-
-            // Mux preserved AAC audio stream alongside video
-            if (muxerStarted && hasCompatibleAudio && audioTrackIndex >= 0) {
-                onProgress(0.90f, "Merging audio track...")
-                val audioBuf = ByteBuffer.allocate(256 * 1024)
-                val audioInfo = MediaCodec.BufferInfo()
-                var firstAudioTs = -1L
-                while (true) {
-                    coroutineContext.ensureActive()
-                    audioInfo.offset = 0
-                    audioInfo.size = audioExtractor.readSampleData(audioBuf, 0)
-                    if (audioInfo.size < 0) break
-                    val ts = audioExtractor.sampleTime
-                    if (firstAudioTs < 0 && ts >= 0) firstAudioTs = ts
-                    audioInfo.presentationTimeUs = (ts - firstAudioTs).coerceAtLeast(0L)
-                    audioInfo.flags = audioExtractor.sampleFlags
-                    muxer.writeSampleData(audioTrackIndex, audioBuf, audioInfo)
-                    audioExtractor.advance()
-                }
-            }
-            onProgress(1f, "Done")
-        } catch (e: Exception) {
-            runCatching { outputFile.delete() }
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            throw IllegalStateException("Video compression failed: ${e.message ?: "Unsupported codec"}", e)
-        } finally {
-            runCatching { retriever.release() }
-            runCatching { audioExtractor.release() }
-            runCatching { encoder.stop() }
-            runCatching { encoder.release() }
-            if (muxerStarted) runCatching { muxer.stop() }
-            runCatching { muxer.release() }
         }
     }
 }

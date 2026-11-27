@@ -9,4 +9,7 @@
     <cache-path
         name="shared_exports"
         path="exports/" />
+    <external-files-path
+        name="local_splits"
+        path="Movies/Ordieo_Splits/" />
 </paths>
